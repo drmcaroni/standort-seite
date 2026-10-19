@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live-Standort</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root {
+    --bg: #f4f5f7; --card: #ffffff; --text: #1b1f24; --muted: #5d6673;
+    --ok: #1a7f4b; --warn: #b26a00; --off: #6b7280; --line: #e2e5ea;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14171b; --card: #1d2227; --text: #eceff3; --muted: #9aa4b1;
+            --ok: #4cc38a; --warn: #f0a63a; --off: #8b94a1; --line: #2c333b; }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+         background: var(--bg); color: var(--text); display: flex; flex-direction: column; }
+  #map { flex: 1 1 auto; min-height: 40vh; }
+  #panel { flex: 0 0 auto; background: var(--card); border-top: 1px solid var(--line);
+           padding: 14px 16px calc(14px + env(safe-area-inset-bottom)); }
+  #state { font-weight: 600; margin-bottom: 10px; display: flex; align-items: center; gap: 8px; }
+  #dot { width: 10px; height: 10px; border-radius: 50%; background: var(--off); flex: none; }
+  .ok #dot { background: var(--ok); } .warn #dot { background: var(--warn); }
+  .ok #state { color: var(--ok); } .warn #state { color: var(--warn); }
+  #grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .cell { background: var(--bg); border-radius: 10px; padding: 8px 10px; min-width: 0; }
+  .label { font-size: 12px; color: var(--muted); }
+  .value { font-size: 20px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .small { font-size: 14px; color: var(--muted); margin-top: 8px; }
+  #center { position: absolute; z-index: 1000; right: 12px; top: 12px; border: 0; border-radius: 10px;
+            padding: 10px 12px; background: var(--card); color: var(--text);
+            box-shadow: 0 1px 6px rgba(0,0,0,.3); font: inherit; display: none; }
+  #wrap { position: relative; flex: 1 1 auto; display: flex; min-height: 40vh; }
+</style>
+</head>
+<body>
+<div id="wrap"><div id="map"></div><button id="center" type="button">Zentrieren</button></div>
+<div id="panel" class="off">
+  <div id="state"><span id="dot"></span><span id="stateText">Lade …</span></div>
+  <div id="grid">
+    <div class="cell"><div class="label">Tempo</div><div class="value" id="speed">–</div></div>
+    <div class="cell"><div class="label">Ankunft</div><div class="value" id="eta">–</div></div>
+    <div class="cell"><div class="label">Noch</div><div class="value" id="left">–</div></div>
+  </div>
+  <div class="small" id="info"></div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(function () {
+  var DB = "https://standort-freigabe-default-rtdb.europe-west1.firebasedatabase.app";
+  var key = new URLSearchParams(location.search).get("k");
+
+  var panel = document.getElementById("panel");
+  var stateText = document.getElementById("stateText");
+  var elSpeed = document.getElementById("speed");
+  var elEta = document.getElementById("eta");
+  var elLeft = document.getElementById("left");
+  var elInfo = document.getElementById("info");
+  var btnCenter = document.getElementById("center");
+
+  function setState(cls, text) { panel.className = cls; stateText.textContent = text; }
+
+  if (!key) { setState("off", "Ungültiger Link"); }
+
+  var map = L.map("map", { zoomControl: true }).setView([47.07, 15.44], 7);
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19, attribution: "&copy; OpenStreetMap-Mitwirkende"
+  }).addTo(map);
+
+  var marker = null, following = true, destShown = null;
+  map.on("dragstart", function () { following = false; btnCenter.style.display = "block"; });
+  btnCenter.addEventListener("click", function () {
+    following = true; btnCenter.style.display = "none";
+    if (marker) map.setView(marker.getLatLng(), Math.max(map.getZoom(), 13));
+  });
+
+  function fmtDuration(ms) {
+    var min = Math.max(0, Math.round(ms / 60000));
+    var h = Math.floor(min / 60), m = min % 60;
+    return h > 0 ? h + " h " + (m < 10 ? "0" : "") + m + " min" : m + " min";
+  }
+  function fmtAge(sec) {
+    if (sec < 60) return sec + " s";
+    return Math.round(sec / 60) + " min";
+  }
+
+  function render(d) {
+    if (!d || typeof d.lat !== "number") {
+      setState("off", "Gerade keine Freigabe aktiv");
+      elSpeed.textContent = elEta.textContent = elLeft.textContent = "–";
+      elInfo.textContent = "Sobald die Fahrt gestartet wird, erscheint der Standort hier.";
+      return;
+    }
+    var now = Date.now();
+    var age = Math.max(0, Math.round((now - d.ts) / 1000));
+    var ll = [d.lat, d.lon];
+
+    if (!marker) {
+      marker = L.circleMarker(ll, { radius: 9, weight: 3, color: "#ffffff",
+                                    fillColor: "#1769e0", fillOpacity: 1 }).addTo(map);
+      map.setView(ll, 13);
+    } else {
+      marker.setLatLng(ll);
+      if (following) map.panTo(ll, { animate: true });
+    }
+
+    elSpeed.textContent = Math.round(d.speed || 0) + " km/h";
+
+    if (d.arrived) {
+      setState("ok", "Angekommen" + (d.dest ? ": " + d.dest : ""));
+      elEta.textContent = "–"; elLeft.textContent = "–";
+    } else {
+      if (age > 120) setState("warn", "Signal seit " + fmtAge(age) + " unterbrochen");
+      else setState("ok", d.dest ? "Unterwegs nach " + d.dest : "Unterwegs");
+
+      if (d.eta) {
+        var etaDate = new Date(d.eta);
+        elEta.textContent = etaDate.toLocaleTimeString("de-AT", { hour: "2-digit", minute: "2-digit" });
+        elLeft.textContent = fmtDuration(d.eta - now);
+      } else {
+        elEta.textContent = "–"; elLeft.textContent = "–";
+      }
+    }
+
+    var parts = ["Zuletzt aktualisiert vor " + fmtAge(age)];
+    if (typeof d.dist === "number" && d.dist >= 0 && !d.arrived) {
+      parts.push("Restweg ca. " + (d.dist / 1000).toFixed(d.dist > 20000 ? 0 : 1) + " km");
+    }
+    if (d.eta) parts.push("Ankunftszeit ohne aktuelle Verkehrslage berechnet");
+    elInfo.textContent = parts.join(" · ");
+  }
+
+  var failures = 0;
+  function poll() {
+    if (!key) return;
+    fetch(DB + "/live/" + encodeURIComponent(key) + ".json", { cache: "no-store" })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function (d) { failures = 0; render(d); })
+      .catch(function () {
+        failures++;
+        if (failures >= 2) { setState("warn", "Keine Verbindung"); }
+      });
+  }
+  poll();
+  setInterval(poll, 5000);
+  document.addEventListener("visibilitychange", function () { if (!document.hidden) poll(); });
+})();
+</script>
+</body>
+</html>
