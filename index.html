@@ -88,9 +88,76 @@
     return Math.round(sec / 60) + " min";
   }
 
+
+  // ---- Route (blaue Linie) ----
+  var routePts = [], routeLine = null, destMarker = null, routeVer = null, loadingVer = null, routeFitted = false;
+
+  function decodePolyline(str) {
+    var i = 0, lat = 0, lng = 0, out = [];
+    while (i < str.length) {
+      var b, shift = 0, res = 0;
+      do { b = str.charCodeAt(i++) - 63; res |= (b & 31) << shift; shift += 5; } while (b >= 32);
+      lat += (res & 1) ? ~(res >> 1) : (res >> 1);
+      shift = 0; res = 0;
+      do { b = str.charCodeAt(i++) - 63; res |= (b & 31) << shift; shift += 5; } while (b >= 32);
+      lng += (res & 1) ? ~(res >> 1) : (res >> 1);
+      out.push([lat / 1e5, lng / 1e5]);
+    }
+    return out;
+  }
+
+  function clearRoute() {
+    if (routeLine) { map.removeLayer(routeLine); routeLine = null; }
+    if (destMarker) { map.removeLayer(destMarker); destMarker = null; }
+    routePts = []; routeVer = null; loadingVer = null;
+  }
+
+  function updateRouteLine(ll) {
+    if (!routeLine || routePts.length === 0) return;
+    var best = 0, bestD = Infinity, k = Math.cos(ll[0] * Math.PI / 180);
+    for (var i = 0; i < routePts.length; i++) {
+      var dy = routePts[i][0] - ll[0], dx = (routePts[i][1] - ll[1]) * k;
+      var dd = dy * dy + dx * dx;
+      if (dd < bestD) { bestD = dd; best = i; }
+    }
+    routeLine.setLatLngs([ll].concat(routePts.slice(best)));
+  }
+
+  function loadRoute(rv, destName, ll) {
+    if (loadingVer === rv) return;
+    loadingVer = rv;
+    fetch(DB + "/live/" + encodeURIComponent(key) + "/r.json", { cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d || !d.p) { loadingVer = null; return; }
+        routePts = decodePolyline(d.p);
+        routeVer = rv;
+        if (routePts.length === 0) return;
+        if (!routeLine) {
+          routeLine = L.polyline([], { color: "#1769e0", weight: 5, opacity: 0.8 }).addTo(map);
+        }
+        var end = routePts[routePts.length - 1];
+        if (!destMarker) {
+          destMarker = L.circleMarker(end, { radius: 8, weight: 3, color: "#ffffff",
+                                             fillColor: "#d93025", fillOpacity: 1 }).addTo(map);
+        } else {
+          destMarker.setLatLng(end);
+        }
+        if (destName) destMarker.bindTooltip(destName);
+        updateRouteLine(ll);
+        if (!routeFitted) {
+          routeFitted = true;
+          following = false; btnCenter.style.display = "block";
+          map.fitBounds(L.latLngBounds(routePts).extend(ll), { padding: [30, 30] });
+        }
+      })
+      .catch(function () { loadingVer = null; });
+  }
+
   function render(d) {
     if (!d || typeof d.lat !== "number") {
       setState("off", "Gerade keine Freigabe aktiv");
+      clearRoute(); routeFitted = false;
       elSpeed.textContent = elEta.textContent = elLeft.textContent = "–";
       elInfo.textContent = "Sobald die Fahrt gestartet wird, erscheint der Standort hier.";
       return;
@@ -107,6 +174,10 @@
       marker.setLatLng(ll);
       if (following) map.panTo(ll, { animate: true });
     }
+
+    if (d.arrived || !d.rv) clearRoute();
+    else if (d.rv !== routeVer) loadRoute(d.rv, d.dest, ll);
+    else updateRouteLine(ll);
 
     elSpeed.textContent = Math.round(d.speed || 0) + " km/h";
 
@@ -137,7 +208,7 @@
   var failures = 0;
   function poll() {
     if (!key) return;
-    fetch(DB + "/live/" + encodeURIComponent(key) + ".json", { cache: "no-store" })
+    fetch(DB + "/live/" + encodeURIComponent(key) + "/p.json", { cache: "no-store" })
       .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
       .then(function (d) { failures = 0; render(d); })
       .catch(function () {
